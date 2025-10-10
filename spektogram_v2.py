@@ -2,11 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Burst Analyzer GUI (fs=192 kHz preferowane)
+
+Zmiany:
+- Naprawa dekodera bitów „tylko > threshold”:
+  • Wygładzanie sygnału detekcji (MA) przed porównaniem z progiem
+  • Dylatacja maski aktywności + margines czasowy na obrzeżach
+  • Wyrównanie bitów wewnątrz każdej aktywnej „run” przez skanowanie offsetu
+- Ograniczenie rysowania do kilku procent próbek (global, okno, spektrogram)
+  • Parametr: „Rysuj % próbek” w sekcji „Wydajność / filtr globalny”
+  • Wykresy 1,4,5 podsamplowane wspólnym indeksem; spektrogram – redukcja kolumn
+
 - Spektrogram (nperseg=1024) na dole – tylko pasmo filtru
 - Poprawione rysowanie >threshold (maskowanie NaN – brak „zalewania”)
 - Dekoder 2‑FSK: 49.6 kHz -> 0, 50.6 kHz -> 1
-  * Tryb 1 (priorytet): z maski progu (det_sig > threshold)
-  * Tryb 2 (fallback): siatka symboli 6 ms + 1 ms (offset optymalizowany)
+  * WYŁĄCZNIE z maski progu (det_sig > threshold) – bez fallbacku „siatki symboli”.
 """
 
 import os, json
@@ -92,6 +101,9 @@ class ScrollableFrame(ttk.Frame):
     def _unbind_mousewheel(self, event=None):
         try:
             self.canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        try:
             self.canvas.unbind_all("<Button-4>")
             self.canvas.unbind_all("<Button-5>")
         except Exception:
@@ -230,12 +242,19 @@ def bandpower_fft_fast(seg, fs, f_center, bw_hz, zp_mult=2):
         return float(mag2[k])
     return float(np.sum(mag2[mask]))
 
-def decimate_for_plot(y, max_points=200000):
-    N = len(y)
-    if N <= max_points:
-        return y
-    step = int(np.ceil(N / max_points))
-    return y[::step]
+# --- Plot thinning helpers ---
+def indices_for_pct(n, pct, max_points=200_000):
+    """Zwróć równomiernie rozłożone indeksy do n próbek wg odsetka pct (%)."""
+    if n <= 2:
+        return np.arange(n, dtype=int)
+    pct = max(0.001, min(float(pct), 100.0)) / 100.0
+    k = min(max_points, max(2, int(np.ceil(n * pct))))
+    return np.linspace(0, n - 1, num=k, dtype=int)
+
+def thin_xy_by_pct(t, y, pct, max_points=200_000):
+    n = len(y)
+    idx = indices_for_pct(n, pct, max_points=max_points)
+    return t[idx], y[idx]
 
 # -------- Main App --------
 class BurstAnalyzerApp(tk.Tk):
@@ -300,6 +319,9 @@ class BurstAnalyzerApp(tk.Tk):
         # Global filtering
         self.global_filter_mode_var = tk.StringVar(value="Auto")
         self.global_filter_auto_max_sec_var = tk.DoubleVar(value=120.0)
+
+        # Plot decimation (% próbek do rysowania)
+        self.plot_pct_var = tk.DoubleVar(value=3.0)  # domyślnie 3%
 
         # Auto analyze toggle
         self.auto_analyze_var = tk.BooleanVar(value=False)
@@ -433,6 +455,10 @@ class BurstAnalyzerApp(tk.Tk):
         ttk.Label(perf_frame, text="Limit (Auto) [s]").grid(row=0, column=2, padx=8, sticky="w")
         self.global_filter_limit_entry = ttk.Entry(perf_frame, textvariable=self.global_filter_auto_max_sec_var, width=8)
         self.global_filter_limit_entry.grid(row=0, column=3, padx=4, sticky="w")
+        ttk.Label(perf_frame, text="Rysuj % próbek").grid(row=0, column=4, padx=8, sticky="w")
+        self.plot_pct_entry = ttk.Entry(perf_frame, textvariable=self.plot_pct_var, width=6)
+        self.plot_pct_entry.grid(row=0, column=5, padx=4, sticky="w")
+        Tooltip(self.plot_pct_entry, "Ile % próbek rysować (np. 3 = ~3%). Dotyczy wykresów 1/4/5 i zagęszczenia kolumn spektrogramu.")
 
         # Auto-analiza + preset
         intel_frame = ttk.Frame(top)
@@ -863,8 +889,22 @@ class BurstAnalyzerApp(tk.Tk):
         ends   = np.where(da == -1)[0]
         return list(zip(starts, ends))
 
+    @staticmethod
+    def _smooth_ma(x, win_samp):
+        if win_samp <= 1:
+            return x.astype(np.float32, copy=False)
+        kernel = np.ones(int(win_samp), dtype=np.float32) / float(win_samp)
+        return np.convolve(x.astype(np.float32), kernel, mode="same")
+
     def _decode_bits_from_mask(self, xf_win, det_sig, fs, s0_abs):
-        """Dekoder z maski progu: tnie tylko tam, gdzie det_sig > threshold."""
+        """
+        Dekoder z maski progu: tnie tylko tam, gdzie (det_sig_smooth > threshold).
+        Wewnętrznie:
+          • wygładzenie det_sig oknem ~0.3*bit_len (min 0.2 ms, max 2 ms),
+          • dylatacja maski o ~0.5 ms,
+          • margines ±0.2*bit_len na krańcach run,
+          • skanowanie offsetu (0..slot) w kroku ~0.5 ms w obrębie każdej run.
+        """
         bit_on = float(self.bit_len_ms_var.get()) / 1000.0
         bit_gap = float(self.bit_gap_ms_var.get()) / 1000.0
         f0_0 = float(self.bit_f0_low_var.get())
@@ -872,16 +912,71 @@ class BurstAnalyzerApp(tk.Tk):
         bw = float(self.bit_bw_hz_var.get())
         thr = float(self.thr_win if self.thr_win is not None else 0.0)
 
-        active = det_sig > thr
+        on_samp = int(round(bit_on * fs))
+        gap_samp = int(round(bit_gap * fs))
+        slot_samp = on_samp + gap_samp
+        if on_samp < 2 or slot_samp < on_samp + 1:
+            return pd.DataFrame(columns=["bidx","t_s_abs","bit","f0_est","P0","P1","conf"]), [], ""
+
+        # 1) Wygładzenie i maska > threshold
+        smooth_ms = float(np.clip(0.3 * self.bit_len_ms_var.get(), 0.2, 2.0))
+        w_smooth = max(1, int(round((smooth_ms/1000.0)*fs)))
+        det_smooth = self._smooth_ma(det_sig, w_smooth)
+        active = det_smooth > thr
+
+        # 2) Dylatacja maski o ~0.5 ms, aby zalać krótkie dołki poniżej progu
+        dilate_ms = 0.5
+        k = max(1, int(round((dilate_ms/1000.0)*fs)))
+        if k > 1:
+            active = (np.convolve(active.astype(np.uint8), np.ones(k, dtype=np.uint8), mode="same") > 0)
+
         runs = self._find_runs_bool(active)
         bits = []
         segs = []
-        on_samp = int(round(bit_on * fs))
-        gap_samp = int(round(bit_gap * fs))
+        bcount = 0
+
+        # 3) Margines na krańcach run
+        margin = max(0, int(round(0.2 * on_samp)))
+
+        # 4) Dla każdej runy – znajdź najlepszy offset bitowy i dekoduj
+        step_offset = max(1, int(round(0.0005 * fs)))  # ~0.5 ms
 
         for L, R in runs:
-            pos = int(L)
-            while pos + on_samp <= min(R, len(xf_win)):
+            L2 = max(0, L - margin)
+            R2 = min(len(xf_win), R + margin)
+            run_len = R2 - L2
+            if run_len < on_samp:
+                continue
+
+            best_score = -np.inf
+            best_off = 0
+
+            # Skanuj offset, oceniaj średnią pewność
+            for off in range(0, slot_samp, step_offset):
+                pos = L2 + off
+                if pos + on_samp > R2:
+                    break
+                confs = []
+                cnt = 0
+                p = pos
+                while p + on_samp <= R2:
+                    seg = xf_win[p:p+on_samp]
+                    P0 = bandpower_fft_fast(seg, fs, f0_0, bw, zp_mult=2)
+                    P1 = bandpower_fft_fast(seg, fs, f0_1, bw, zp_mult=2)
+                    conf = (abs(P1 - P0)) / (P0 + P1 + 1e-12)
+                    confs.append(conf)
+                    cnt += 1
+                    p += slot_samp
+                if cnt == 0:
+                    continue
+                score = float(np.mean(confs))
+                if score > best_score:
+                    best_score = score
+                    best_off = off
+
+            # Dekoduj z najlepszym offsetem (wciąż w granicach runy)
+            pos = L2 + best_off
+            while pos + on_samp <= R2:
                 seg = xf_win[pos:pos+on_samp]
                 P0 = bandpower_fft_fast(seg, fs, f0_0, bw, zp_mult=2)
                 P1 = bandpower_fft_fast(seg, fs, f0_1, bw, zp_mult=2)
@@ -889,100 +984,18 @@ class BurstAnalyzerApp(tk.Tk):
                 bit = 0 if P0 >= P1 else 1
                 conf = (max(P0, P1) - min(P0, P1)) / (P0 + P1 + 1e-12)
                 t_abs = (s0_abs + pos) / fs
-                bits.append(dict(bidx=len(bits), t_s_abs=float(t_abs), bit=int(bit),
+                bits.append(dict(bidx=bcount, t_s_abs=float(t_abs), bit=int(bit),
                                  f0_est=float(f0_est), P0=float(P0), P1=float(P1), conf=float(conf)))
                 segs.append((s0_abs + pos, s0_abs + pos + on_samp))
-                pos += on_samp + gap_samp
+                bcount += 1
+                pos += slot_samp
 
         bits_df = pd.DataFrame(bits) if bits else pd.DataFrame(columns=["bidx","t_s_abs","bit","f0_est","P0","P1","conf"])
         bits_str = "".join(str(int(b)) for b in bits_df["bit"].tolist()) if len(bits_df) else ""
         return bits_df, segs, bits_str
 
-    def _decode_bits_symbol_grid(self, xf_win, fs, s0_abs):
-        """
-        Dekoduj bity bez progowania: skanuj przesunięcie siatki 6ms+1ms
-        i klasyfikuj sloty porównując moc w paśmie f0(0) i f0(1).
-        Zwraca: bits_df, segs, bits_str, best_offset_samples
-        """
-        Tb = float(self.bit_len_ms_var.get()) / 1000.0   # 6 ms
-        Tg = float(self.bit_gap_ms_var.get()) / 1000.0   # 1 ms
-        Ts = Tb + Tg                                     # 7 ms (slot)
-        on_samp = int(round(Tb * fs))
-        slot_samp = int(round(Ts * fs))
-        if on_samp < 4 or slot_samp < on_samp + 1:
-            return pd.DataFrame(), [], "", 0
-
-        f0_0 = float(self.bit_f0_low_var.get())   # ~49600
-        f0_1 = float(self.bit_f0_high_var.get())  # ~50600
-        bw    = float(self.bit_bw_hz_var.get())   # np. 200 Hz
-        zp    = 2  # zero-padding x2 – wystarcza dla 6ms
-
-        step = max(1, slot_samp // 20)  # ~5% slota
-        best = dict(score=-np.inf, offset=0, rows=None, keep_mask=None)
-
-        for offset in range(0, slot_samp, step):
-            pos = offset
-            rows = []
-            Psum_list = []
-            conf_list = []
-
-            while pos + on_samp <= len(xf_win):
-                seg = xf_win[pos:pos+on_samp]
-                P0 = bandpower_fft_fast(seg, fs, f0_0, bw, zp_mult=zp)
-                P1 = bandpower_fft_fast(seg, fs, f0_1, bw, zp_mult=zp)
-                bit = 0 if P0 >= P1 else 1
-                conf = (abs(P1 - P0)) / (P0 + P1 + 1e-12)
-                f0e = dominant_freq(seg, fs, method=self.fft_method_var.get(), zp_mult=int(self.fft_zp_var.get()))
-                t_abs = (s0_abs + pos) / fs
-                rows.append((t_abs, bit, f0e, P0, P1, conf))
-                Psum_list.append(P0 + P1)
-                conf_list.append(conf)
-                pos += slot_samp
-
-            if not rows:
-                continue
-
-            Psum = np.array(Psum_list, dtype=float)
-            med = np.median(Psum)
-            mad = np.median(np.abs(Psum - med)) + 1e-12
-            thr_energy = med + 3.0 * mad
-            keep = Psum > thr_energy
-            if np.sum(keep) < max(3, int(0.1 * len(Psum))):
-                active_conf = np.mean(conf_list) * 0.5
-            else:
-                active_conf = float(np.mean(np.array(conf_list)[keep]))
-
-            score = active_conf
-            if score > best["score"]:
-                best.update(score=score, offset=offset, rows=rows, keep_mask=keep)
-
-        if best["rows"] is None:
-            return pd.DataFrame(), [], "", 0
-
-        rows = best["rows"]
-        keep = best.get("keep_mask", None)
-        if keep is not None and np.any(keep):
-            idx_sel = np.where(keep)[0]
-        else:
-            idx_sel = np.arange(len(rows))
-
-        bits = []
-        segs = []
-        for i, k in enumerate(idx_sel):
-            t_abs, bit, f0e, P0, P1, conf = rows[k]
-            start_samp = s0_abs + best["offset"] + k * slot_samp
-            segs.append((start_samp, start_samp + on_samp))
-            bits.append(dict(
-                bidx=i, t_s_abs=float(t_abs), bit=int(bit),
-                f0_est=float(f0e), P0=float(P0), P1=float(P1), conf=float(conf)
-            ))
-
-        bits_df = pd.DataFrame(bits)
-        bits_str = "".join(str(int(b)) for b in bits_df["bit"].tolist()) if len(bits_df) else ""
-        return bits_df, segs, bits_str, int(best["offset"])
-
     def decode_bits_only(self):
-        """Ręczne wywołanie dekodera dla aktualnej ramki."""
+        """Ręczne wywołanie dekodera dla aktualnej ramki — WYŁĄCZNIE > threshold."""
         if self.fs is None or self.x is None or self.det_sig_win is None:
             messagebox.showwarning(APP_TITLE, "Najpierw wczytaj plik i uruchom analizę ramki.")
             return
@@ -1002,14 +1015,12 @@ class BurstAnalyzerApp(tk.Tk):
                 xf_win = self.x[s0:s1]
 
         bits_df, segs, bits_str = self._decode_bits_from_mask(xf_win, self.det_sig_win, fs, s0)
-        if bits_df is None or bits_df.empty:
-            bits_df, segs, bits_str, _ = self._decode_bits_symbol_grid(xf_win, fs, s0)
         self.bits_df = bits_df
         self.bits_segments = segs
         self.bits_string = bits_str
         self.update_bits_table_and_stats()
         self.update_window_plots()
-        self._set_status(f"Dekodowanie bitów zakończone. Znaleziono {len(bits_df)}.")
+        self._set_status(f"Dekodowanie bitów (tylko > threshold). Znaleziono {len(bits_df)}.")
 
     # ---------- Analysis (WINDOW ONLY) ----------
     def analyze_window(self):
@@ -1070,7 +1081,7 @@ class BurstAnalyzerApp(tk.Tk):
         min_width_samp = int((min_width / 1000.0) * fs)
         if min_distance < 1: min_distance = 1
         if min_width_samp < 1: min_width_samp = 1
-        peaks_loc, props = find_peaks(det_sig, height=thr_win, distance=min_distance, width=min_width_samp)
+        peaks_loc, _ = find_peaks(det_sig, height=thr_win, distance=min_distance, width=min_width_samp)
         peaks_abs = s0 + peaks_loc
 
         # Intervals & repetition frequency
@@ -1100,14 +1111,10 @@ class BurstAnalyzerApp(tk.Tk):
         intraburst_freqs = np.array(intraburst_freqs)
         burst_durations_ms = np.array(burst_durations_ms)
 
-        # Bit decoding on this window (mask -> fallback grid)
+        # Bit decoding on this window — WYŁĄCZNIE maska progu
         self.thr_win = thr_win  # ustaw zanim użyjemy _decode_bits_from_mask
         bits_df, segs, bits_str = self._decode_bits_from_mask(xf_win, det_sig, fs, s0)
-        bits_mode = "mask"
-        best_offset = None
-        if bits_df is None or bits_df.empty:
-            bits_df, segs, bits_str, best_offset = self._decode_bits_symbol_grid(xf_win, fs, s0)
-            bits_mode = f"grid (offset≈{ (best_offset or 0)/fs:.6f}s)"
+        bits_mode = "threshold_only"
 
         # Summaries
         summary = {
@@ -1162,10 +1169,7 @@ class BurstAnalyzerApp(tk.Tk):
         self.update_window_plots()
         if len(per_burst):
             self.select_tree_index(0)
-        if best_offset is not None:
-            self._set_status(f"Dekodowanie bitów: {bits_mode}, {len(bits_df)} bitów.")
-        else:
-            self._set_status("Gotowy")
+        self._set_status(f"Dekodowanie bitów: {bits_mode}, liczba bitów = {len(bits_df)}.")
 
     # ---------- UI updates ----------
     def update_stats(self):
@@ -1221,16 +1225,24 @@ class BurstAnalyzerApp(tk.Tk):
         if self.fs is None or self.x is None or self.env_full is None:
             self.canvas1.draw_idle(); return
         fs = self.fs
+        pct = float(self.plot_pct_var.get())
         t = np.arange(len(self.x)) / fs
-        t_plot = decimate_for_plot(t)
+        idx = indices_for_pct(len(t), pct)
+
         if self.xf is not None and len(self.xf) == len(self.x):
-            x_plot = decimate_for_plot(self.xf)
-            self.ax1.plot(t_plot[:len(x_plot)], x_plot, label="bandpass")
+            y = self.xf
+            self.ax1.plot(t[idx], y[idx], label="bandpass")
         else:
-            x_plot = decimate_for_plot(self.x)
-            self.ax1.plot(t_plot[:len(x_plot)], x_plot, label="raw")
-        e_plot = decimate_for_plot(self.env_full)
-        self.ax1.plot(t_plot[:len(e_plot)], e_plot, label="envelope")
+            y = self.x
+            self.ax1.plot(t[idx], y[idx], label="raw")
+
+        e = self.env_full
+        if len(e) == len(t):
+            self.ax1.plot(t[idx], e[idx], label="envelope")
+        else:
+            # awaryjnie
+            self.ax1.plot(t[idx], e[:len(idx)], label="envelope")
+
         win = max(0.001, float(self.window_len_var.get())); start = float(self.window_start_var.get())
         self.ax1.axvline(start, linestyle="--"); self.ax1.axvline(start + win, linestyle="--")
         self.ax1.legend()
@@ -1248,13 +1260,16 @@ class BurstAnalyzerApp(tk.Tk):
             self.canvas4.draw_idle(); self.canvas5.draw_idle(); self.canvas6.draw_idle(); return
 
         fs = self.fs
+        pct = float(self.plot_pct_var.get())
         win = max(0.001, float(self.window_len_var.get())); start = float(self.window_start_var.get())
         s0 = int(max(0, np.floor(start * fs))); s1 = int(min(len(self.x), np.ceil((start + win) * fs)))
         if s1 <= s0: s1 = min(len(self.x), s0 + 1)
         t = np.arange(s0, s1) / fs
+        n = len(t)
+        idx = indices_for_pct(n, pct)
 
         # raw
-        self.ax4.plot(t, self.x[s0:s1])
+        self.ax4.plot(t[idx], self.x[s0:s1][idx])
 
         # filtered slice (prefer global)
         low = float(self.bp_low_var.get()); high = float(self.bp_high_var.get()); order = int(self.bp_order_var.get())
@@ -1271,8 +1286,8 @@ class BurstAnalyzerApp(tk.Tk):
             except Exception:
                 xf_slice = self.x[s0:s1]; slice_filtered = False
 
-        # wykres 5: sygnał przefiltrowany
-        self.ax5.plot(t, xf_slice, label=("bandpass" if slice_filtered else "raw (no filter)"))
+        # wykres 5: sygnał przefiltrowany (cienki rysunek)
+        self.ax5.plot(t[idx], xf_slice[idx], label=("bandpass" if slice_filtered else "raw (no filter)"))
         if slice_filtered:
             msg = f"Filtr OK: {low:.0f}–{high:.0f} Hz (Nyquist {nyq:.0f} Hz)"
         else:
@@ -1282,11 +1297,11 @@ class BurstAnalyzerApp(tk.Tk):
         # detekcja + próg + piki (TYLKO jeśli analiza tej ramki)
         if self.det_sig_win is not None and self.s0 == s0 and self.s1 == s1:
             if self.show_env_in_window_var.get():
-                self.ax5.plot(t, self.det_sig_win, label="detekcja (env/|xf|)")
+                self.ax5.plot(t[idx], self.det_sig_win[idx], label="detekcja (env/|xf|)")
             if self.thr_win is not None:
                 y_high = self.det_sig_win.copy()
                 y_high[self.det_sig_win <= self.thr_win] = np.nan
-                self.ax5.plot(t, y_high, linewidth=2, label="> threshold")
+                self.ax5.plot(t[idx], y_high[idx], linewidth=2, label="> threshold")
                 if self.thr_domain_var.get() == "abs_filtered" and self.thr_show_pm_var.get():
                     self.ax5.axhline(self.thr_win, linestyle="--", label="+threshold")
                     self.ax5.axhline(-self.thr_win, linestyle="--", label="-threshold")
@@ -1299,7 +1314,7 @@ class BurstAnalyzerApp(tk.Tk):
                     det_vals = self.det_sig_win[(self.peaks_win_abs[mask] - s0)]
                     self.ax5.plot(pk_times, det_vals, marker="o", linestyle="None", label="peaks")
 
-        # Wykres 6: SPEKTROGRAM tylko w paśmie BP
+        # Wykres 6: SPEKTROGRAM tylko w paśmie BP (redukcja kolumn wg pct)
         nperseg = 1024
         nperseg_eff = min(nperseg, len(xf_slice)) if len(xf_slice) else nperseg
         if nperseg_eff >= 8:
@@ -1310,6 +1325,14 @@ class BurstAnalyzerApp(tk.Tk):
                 xf_slice, fs=fs, nperseg=nperseg_eff, noverlap=noverlap, nfft=nperseg_eff,
                 scaling='density', mode='psd', detrend=False
             )
+            # Redukcja liczby kolumn wg pct (tylko rysowanie)
+            if t_spec.size > 0:
+                cols = max(8, int(np.ceil(t_spec.size * max(0.001, min(pct, 100.0))/100.0)))
+                if cols < t_spec.size:
+                    cidx = np.linspace(0, t_spec.size-1, num=cols, dtype=int)
+                    t_spec = t_spec[cidx]
+                    Sxx = Sxx[:, cidx]
+
             fmask = (f_spec >= low) & (f_spec <= high)
             if not np.any(fmask):
                 fmask = slice(None, None, None)
@@ -1336,16 +1359,17 @@ class BurstAnalyzerApp(tk.Tk):
         # Oznacz bity (jeśli są)
         if self.bits_segments and self.s0 == s0 and self.s1 == s1 and self.bits_df is not None:
             ylim5 = self.ax5.get_ylim()
-            ylim6 = self.ax6.get_ylim()
-            for idx, (seg_pair) in enumerate(self.bits_segments):
-                if idx >= len(self.bits_df):
+            low = float(self.bp_low_var.get()); high = float(self.bp_high_var.get())
+            for idx_b, (seg_pair) in enumerate(self.bits_segments):
+                if idx_b >= len(self.bits_df):
                     break
                 L_abs, R_abs = seg_pair
-                row = self.bits_df.iloc[idx]
+                row = self.bits_df.iloc[idx_b]
                 tL = L_abs / fs; tR = R_abs / fs; tc = 0.5*(tL+tR); b = int(row["bit"])
                 self.ax5.axvline(tL, linestyle=":", alpha=0.7)
                 self.ax5.axvline(tR, linestyle=":", alpha=0.7)
                 self.ax5.text(tc, ylim5[1]*0.9, str(b), ha="center", va="top")
+                # na spektrogramie opcjonalnie linie pionowe:
                 self.ax6.axvline(tL, linestyle=":", alpha=0.7)
                 self.ax6.axvline(tR, linestyle=":", alpha=0.7)
                 self.ax6.text(tc, low + 0.9*(high-low), str(b), ha="center", va="top")
@@ -1421,6 +1445,7 @@ class BurstAnalyzerApp(tk.Tk):
             win_len=float(self.window_len_var.get()), win_start=float(self.window_start_var.get()),
             fft_method=self.fft_method_var.get(), fft_zp=int(self.fft_zp_var.get()),
             global_filter_mode=self.global_filter_mode_var.get(), global_auto_limit=float(self.global_filter_auto_max_sec_var.get()),
+            plot_pct=float(self.plot_pct_var.get()),
             bit_on_ms=float(self.bit_len_ms_var.get()), bit_gap_ms=float(self.bit_gap_ms_var.get()),
             bit_f0_0=float(self.bit_f0_low_var.get()), bit_f0_1=float(self.bit_f0_high_var.get()),
             bit_bw=float(self.bit_bw_hz_var.get())
@@ -1437,6 +1462,7 @@ class BurstAnalyzerApp(tk.Tk):
             if "fft_zp" in p: self.fft_zp_var.set(int(p["fft_zp"]))
             if "global_filter_mode" in p: self.global_filter_mode_var.set(p["global_filter_mode"])
             if "global_auto_limit" in p: self.global_filter_auto_max_sec_var.set(float(p["global_auto_limit"]))
+            if "plot_pct" in p: self.plot_pct_var.set(float(p["plot_pct"]))
             if "bit_on_ms" in p: self.bit_len_ms_var.set(float(p["bit_on_ms"]))
             if "bit_gap_ms" in p: self.bit_gap_ms_var.set(float(p["bit_gap_ms"]))
             if "bit_f0_0" in p: self.bit_f0_low_var.set(float(p["bit_f0_0"]))
